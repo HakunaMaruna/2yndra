@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 # Проверка прав root
@@ -28,10 +28,21 @@ read_yes_no() {
   local prompt="$1"
   while true; do
     read -rp "$prompt (Да/Нет): " choice
+    # Приводим к нижнему регистру для унификации
+    choice=$(echo "$choice" | tr '[:upper:]' '[:lower:]')
+
     case "$choice" in
-      [Yy]|[Дд]) echo "yes"; return ;;
-      [Nn]|[Нн]) echo "no"; return ;;
-      *) echo -e "${RED}Пожалуйста, введите Да или Нет.${NC}" ;;
+      "да"|"д"|"y"|"yes")
+        echo "yes"
+        return 0
+        ;;
+      "нет"|"н"|"n"|"no")
+        echo "no"
+        return 0
+        ;;
+      *)
+        echo -e "${RED}Пожалуйста, введите Да или Нет (или Y/N).${NC}"
+        ;;
     esac
   done
 }
@@ -44,6 +55,7 @@ do_update() {
   if [[ $(read_yes_no "Хотите обновить систему (apt upgrade)?") == "yes" ]]; then
     echo -e "${GREEN}Выполняем apt upgrade...${NC}"
     apt upgrade -y
+    echo -e "${GREEN}Система обновлена.${NC}"
   else
     echo "Пропуск обновления системы."
   fi
@@ -67,8 +79,6 @@ do_install_docker() {
   sh get-docker.sh
   rm get-docker.sh
 
-  # Добавляем текущего пользователя в группу docker (если нужно)
-  # Здесь мы не добавляем новых пользователей в docker автоматически, это делается отдельно.
   echo -e "${GREEN}Docker установлен.${NC}"
 }
 
@@ -89,12 +99,6 @@ do_create_ssh_user() {
   # Устанавливаем пароль
   echo "${username}:${password}" | chpasswd
 
-  # Разрешаем только SSH-туннели: запрещаем интерактивную оболочку, но разрешаем туннелирование
-  # Для этого можно использовать ForceCommand или просто оставить nologin — при nologin вход по SSH возможен,
-  # но интерактивная сессия не запускается; туннели при этом работают.
-  # Дополнительно можно настроить в /etc/ssh/sshd_config ForceCommand internal-sftp (если нужен только SFTP),
-  # но для «только SSH туннель» достаточно nologin.
-
   echo -e "${GREEN}Пользователь '$username' создан.${NC}"
   echo -e "${YELLOW}Пароль:${NC} $password"
   echo "Пользователь не может запускать интерактивные программы (оболочка /usr/sbin/nologin)."
@@ -103,13 +107,12 @@ do_create_ssh_user() {
 
 # Пункт 4: Удалить пользователя
 do_delete_user() {
-  # Получаем список пользователей, исключая системные/служебные для простоты (можно расширить фильтр)
-  # Выводим только обычных пользователей (UID >= 1000)
+  # Получаем список пользователей (UID >= 1000)
   mapfile -t users < <(getent passwd | awk -F: '$3 >= 1000 {print $1}' | sort)
 
   if [[ ${#users[@]} -eq 0 ]]; then
     echo "Нет пользователей для удаления (UID >= 1000)."
-    return
+    return  # Завершаем функцию, если пользователей нет
   fi
 
   echo "Список пользователей (UID >= 1000):"
