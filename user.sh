@@ -1,195 +1,154 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Проверка прав root
+if [[ $EUID -ne 0 ]]; then
+  echo "Этот скрипт нужно запускать от root (sudo)." >&2
+  exit 1
+fi
+
 # Цвета для вывода
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Функция для вывода ошибок
-error() {
-    echo -e "${RED}Ошибка: $1${NC}" >&2
+print_menu() {
+  clear
+  echo -e "${YELLOW}=== Системное меню ===${NC}"
+  echo "1) Обновить репозитории (apt update)"
+  echo "2) Установить Docker"
+  echo "3) Создать пользователя SSH (только туннель, без установки программ)"
+  echo "4) Удалить пользователя"
+  echo "0) Выход"
+  echo ""
 }
 
-# Функция для вывода успехов
-success() {
-    echo -e "${GREEN}$1${NC}"
+read_yes_no() {
+  local prompt="$1"
+  while true; do
+    read -rp "$prompt (Да/Нет): " choice
+    case "$choice" in
+      [Yy]|[Дд]) echo "yes"; return ;;
+      [Nn]|[Нн]) echo "no"; return ;;
+      *) echo -e "${RED}Пожалуйста, введите Да или Нет.${NC}" ;;
+    esac
+  done
 }
 
-# Функция для предупреждений
-warning() {
-    echo -e "${YELLOW}$1${NC}"
+# Пункт 1: Обновление репозиториев и системы
+do_update() {
+  echo -e "${GREEN}Выполняем apt update...${NC}"
+  apt update -y
+
+  if [[ $(read_yes_no "Хотите обновить систему (apt upgrade)?") == "yes" ]]; then
+    echo -e "${GREEN}Выполняем apt upgrade...${NC}"
+    apt upgrade -y
+  else
+    echo "Пропуск обновления системы."
+  fi
 }
 
-# Проверка прав root
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        error "Этот скрипт нужно запускать от root (sudo)."
-        exit 1
-    fi
+# Пункт 2: Установка Docker
+do_install_docker() {
+  if [[ $(read_yes_no "Установить Docker?") != "yes" ]]; then
+    echo "Установка Docker пропущена."
+    return
+  fi
+
+  # Базовая проверка наличия curl
+  if ! command -v curl &> /dev/null; then
+    echo "Устанавливаем curl для загрузки скрипта Docker..."
+    apt update && apt install -y curl
+  fi
+
+  echo "Загружаем официальный скрипт установки Docker..."
+  curl -fsSL https://get.docker.com -o get-docker.sh
+  sh get-docker.sh
+  rm get-docker.sh
+
+  # Добавляем текущего пользователя в группу docker (если нужно)
+  # Здесь мы не добавляем новых пользователей в docker автоматически, это делается отдельно.
+  echo -e "${GREEN}Docker установлен.${NC}"
 }
 
-# Валидация имени пользователя
-validate_username() {
-    local username=$1
-    if ! [[ "$username" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
-        return 1
-    fi
-    return 0
+# Пункт 3: Создать пользователя SSH только для туннеля
+do_create_ssh_user() {
+  read -rp "Введите имя нового пользователя (латинские буквы, без спецсимволов): " username
+  if ! [[ "$username" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+    echo -e "${RED}Некорректное имя пользователя.${NC}"
+    return 1
+  fi
+
+  # Генерируем случайный пароль
+  password=$(openssl rand -base64 12 | tr -dc 'A-Za-z0-9_!@#$%')
+
+  # Создаём пользователя с минимальной оболочкой (nologin)
+  useradd -m -s /usr/sbin/nologin "$username"
+
+  # Устанавливаем пароль
+  echo "${username}:${password}" | chpasswd
+
+  # Разрешаем только SSH-туннели: запрещаем интерактивную оболочку, но разрешаем туннелирование
+  # Для этого можно использовать ForceCommand или просто оставить nologin — при nologin вход по SSH возможен,
+  # но интерактивная сессия не запускается; туннели при этом работают.
+  # Дополнительно можно настроить в /etc/ssh/sshd_config ForceCommand internal-sftp (если нужен только SFTP),
+  # но для «только SSH туннель» достаточно nologin.
+
+  echo -e "${GREEN}Пользователь '$username' создан.${NC}"
+  echo -e "${YELLOW}Пароль:${NC} $password"
+  echo "Пользователь не может запускать интерактивные программы (оболочка /usr/sbin/nologin)."
+  echo "SSH-туннели будут работать."
 }
 
-# Генерация пароля
-generate_password() {
-    openssl rand -base64 24 | tr -dc 'A-Za-z0-9!@#$%^&*'
+# Пункт 4: Удалить пользователя
+do_delete_user() {
+  # Получаем список пользователей, исключая системные/служебные для простоты (можно расширить фильтр)
+  # Выводим только обычных пользователей (UID >= 1000)
+  mapfile -t users < <(getent passwd | awk -F: '$3 >= 1000 {print $1}' | sort)
+
+  if [[ ${#users[@]} -eq 0 ]]; then
+    echo "Нет пользователей для удаления (UID >= 1000)."
+    return
+  fi
+
+  echo "Список пользователей (UID >= 1000):"
+  for i in "${!users[@]}"; do
+    echo "$((i+1))) ${users[i]}"
+  done
+
+  read -rp "Введите номер пользователя для удаления: " choice
+  # Проверяем, что выбор корректен
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#users[@]} )); then
+    echo -e "${RED}Неверный выбор.${NC}"
+    return 1
+  fi
+
+  target_user="${users[$((choice-1))]}"
+
+  if [[ $(read_yes_no "Вы уверены, что хотите удалить пользователя '$target_user'?") != "yes" ]]; then
+    echo "Удаление отменено."
+    return
+  fi
+
+  userdel -r "$target_user"
+  echo -e "${GREEN}Пользователь '$target_user' удалён вместе с домашней директорией.${NC}"
 }
 
-# Создание пользователя
-create_user() {
-    read -p "Введите имя нового пользователя (только латинские буквы, без спецсимволов): " username
+# Основной цикл меню
+while true; do
+  print_menu
+  read -rp "Выберите пункт меню: " option
 
-    if [[ -z "$username" ]]; then
-        error "Имя пользователя не может быть пустым."
-        return 1
-    fi
+  case "$option" in
+    1) do_update ;;
+    2) do_install_docker ;;
+    3) do_create_ssh_user ;;
+    4) do_delete_user ;;
+    0) echo "Выход из скрипта."; break ;;
+    *) echo -e "${RED}Неверный пункт меню.${NC}"; sleep 1 ;;
+  esac
 
-    if ! validate_username "$username"; then
-        error "Некорректное имя пользователя."
-        return 1
-    fi
-
-    # Проверяем, существует ли пользователь
-    if id "$username" &>/dev/null; then
-        error "Пользователь '$username' уже существует."
-        return 1
-    fi
-
-    # Генерация пароля
-    password=$(generate_password)
-
-    # Создание пользователя: /usr/sbin/nologin запрещает локальный вход
-    useradd -m -s /usr/sbin/nologin "$username"
-
-    # Установка пароля
-    echo "${username}:${password}" | chpasswd
-
-    success "Пользователь '$username' создан."
-
-    # Запрет sudo
-    echo "${username} ALL=(ALL) NOPASSWD: /bin/false" > /etc/sudoers.d/"${username}_no_sudo"
-    chmod 0440 /etc/sudoers.d/"${username}_no_sudo"
-
-    # Убираем из групп, которые могут давать права
-    if id "$username" | grep -q "\bsudo\b"; then
-        gpasswd -d "$username" sudo || true
-    fi
-
-    # Запрет установки программ через ACL
-    if command -v setfacl &> /dev/null; then
-        for cmd in /usr/bin/apt /usr/bin/apt-get; do
-            if [[ -x "$cmd" ]]; then
-                setfacl -m u:"${username}:---" "$cmd" 2>/dev/null || true
-            fi
-        done
-    fi
-
-    # Настройка SSH для туннелирования
-    SSHD_CONFIG="/etc/ssh/sshd_config"
-
-    if ! grep -q "^Match User ${username}" "$SSHD_CONFIG"; then
-        cat >> "$SSHD_CONFIG" <<EOF
-
-Match User ${username}
-    AllowTcpForwarding yes
-    X11Forwarding no
-    PermitTunnel yes
-    ForceCommand echo 'Tunneling only'; sleep infinity
-EOF
-        success "Добавлен блок Match User для ${username} в sshd_config."
-    else
-        warning "Пользователь уже имеет блок Match в sshd_config — проверьте вручную."
-    fi
-
-    echo ""
-    success "=== Готово ==="
-    echo "Пользователь: $username"
-    echo "Пароль: $password"
-    echo ""
-    echo "Обязательно выполните:"
-    echo "  sudo systemctl restart ssh"
-    echo ""
-    echo "Как проверить туннель:"
-    echo "  ssh -N -L 8080:localhost:80 ${username}@ваш_сервер"
-    echo "Попытка обычного входа (ssh ${username}@ваш_сервер) должна выводить 'Tunneling only' и закрывать сессию."
-}
-
-# Удаление пользователя
-delete_user() {
-    read -p "Введите имя пользователя для удаления: " username
-
-    if [[ -z "$username" ]]; then
-        error "Имя пользователя не может быть пустым."
-        return 1
-    fi
-
-    # Проверяем существование пользователя
-    if ! id "$username" &>/dev/null; then
-        error "Пользователь '$username' не существует."
-        return 1
-    fi
-
-    echo -n "Вы уверены, что хотите удалить пользователя '$username' и все его данные? (y/N): "
-    read -r confirm
-
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo "Удаление отменено."
-        return 0
-    fi
-
-    # Удаляем файл sudoers
-    sudoers_file="/etc/sudoers.d/${username}_no_sudo"
-    if [[ -f "$sudoers_file" ]]; then
-        rm -f "$sudoers_file"
-        success "Удален файл sudoers для пользователя '$username'."
-    fi
-
-    # Удаляем ACL правила
-    if command -v getfacl &> /dev/null; then
-        for cmd in /usr/bin/apt /usr/bin/apt-get; do
-            if [[ -x "$cmd" ]] && getfacl "$cmd" 2>/dev/null | grep -q "user:$username"; then
-                setfacl -x u:"$username" "$cmd" 2>/dev/null || true
-            fi
-        done
-        success "Удалены ACL правила для пользователя '$username'."
-    fi
-
-    # Удаляем блок из sshd_config
-    SSHD_CONFIG="/etc/ssh/sshd_config"
-    if grep -q "^Match User ${username}" "$SSHD_CONFIG"; then
-        # Создаем временный файл без блока пользователя
-        tmp_file=$(mktemp)
-        awk -v user="$username" '
-            /^Match User / {
-                if ($3 == user) {
-                    in_block = 1
-                    next
-                } else if (in_block) {
-                    if (/^[^ ]/) in_block = 0
-                    else next
-                }
-            }
-            !in_block
-        ' "$SSHD_CONFIG" > "$tmp_file"
-
-        # Копируем обратно, если файл изменился
-        if [[ $(wc -l < "$tmp_file") -lt $(wc -l < "$SSHD_CONFIG") ]]; then
-            cp "$tmp_file" "$SSHD_CONFIG"
-            success "Удален блок Match User для '$username' из sshd_config."
-        fi
-        rm -f "$tmp_file"
-    fi
-
-    # Удаляем пользователя и его домашнюю директорию
-    userdel -r "$username" 2>/dev/null || userdel "$username"
-
-    success
+  echo ""
+  read -rp "Нажмите Enter, чтобы продолжить..."
+done
