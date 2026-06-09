@@ -1,79 +1,195 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $EUID -ne 0 ]]; then
-   echo "Этот скрипт нужно запускать от root (sudo)." >&2
-   exit 1
-fi
+# Цвета для вывода
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
 
-read -p "Введите имя нового пользователя (только латинские буквы, без спецсимволов): " username
+# Функция для вывода ошибок
+error() {
+    echo -e "${RED}Ошибка: $1${NC}" >&2
+}
 
-if ! [[ "$username" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
-   echo "Некорректное имя пользователя." >&2
-   exit 1
-fi
+# Функция для вывода успехов
+success() {
+    echo -e "${GREEN}$1${NC}"
+}
+
+# Функция для предупреждений
+warning() {
+    echo -e "${YELLOW}$1${NC}"
+}
+
+# Проверка прав root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        error "Этот скрипт нужно запускать от root (sudo)."
+        exit 1
+    fi
+}
+
+# Валидация имени пользователя
+validate_username() {
+    local username=$1
+    if ! [[ "$username" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+        return 1
+    fi
+    return 0
+}
 
 # Генерация пароля
-password=$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9!@#$%^&*')
+generate_password() {
+    openssl rand -base64 24 | tr -dc 'A-Za-z0-9!@#$%^&*'
+}
 
-# Создание пользователя: /usr/sbin/nologin запрещает локальный вход
-useradd -m -s /usr/sbin/nologin "$username"
+# Создание пользователя
+create_user() {
+    read -p "Введите имя нового пользователя (только латинские буквы, без спецсимволов): " username
 
-# Установка пароля
-echo "${username}:${password}" | chpasswd
+    if [[ -z "$username" ]]; then
+        error "Имя пользователя не может быть пустым."
+        return 1
+    fi
 
-echo "Пользователь '$username' создан."
-echo "Сгенерированный пароль: $password"
+    if ! validate_username "$username"; then
+        error "Некорректное имя пользователя."
+        return 1
+    fi
 
-# Запрет sudo: правило, которое при вызове sudo всегда выполняет /bin/false
-echo "${username} ALL=(ALL) NOPASSWD: /bin/false" > /etc/sudoers.d/"${username}_no_sudo"
-chmod 0440 /etc/sudoers.d/"${username}_no_sudo"
+    # Проверяем, существует ли пользователь
+    if id "$username" &>/dev/null; then
+        error "Пользователь '$username' уже существует."
+        return 1
+    fi
 
-# Убираем из групп, которые могут давать права (на Ubuntu это в первую очередь sudo)
-if id "$username" | grep -q "\bsudo\b"; then
-   gpasswd -d "$username" sudo || true
-fi
+    # Генерация пароля
+    password=$(generate_password)
 
-# Запрет установки программ: блокируем прямой запуск apt/apt-get через ACL (если acl есть)
-if command -v setfacl &> /dev/null; then
-   for cmd in /usr/bin/apt /usr/bin/apt-get; do
-      if [[ -x "$cmd" ]]; then
-         setfacl -m u:"${username}:---" "$cmd" 2>/dev/null || true
-      fi
-   done
-fi
+    # Создание пользователя: /usr/sbin/nologin запрещает локальный вход
+    useradd -m -s /usr/sbin/nologin "$username"
 
-# Настройка SSH только для туннелирования
-SSHD_CONFIG="/etc/ssh/sshd_config"
+    # Установка пароля
+    echo "${username}:${password}" | chpasswd
 
-if ! grep -q "^Match User ${username}" "$SSHD_CONFIG"; then
-   cat >> "$SSHD_CONFIG" <<EOF
+    success "Пользователь '$username' создан."
+
+    # Запрет sudo
+    echo "${username} ALL=(ALL) NOPASSWD: /bin/false" > /etc/sudoers.d/"${username}_no_sudo"
+    chmod 0440 /etc/sudoers.d/"${username}_no_sudo"
+
+    # Убираем из групп, которые могут давать права
+    if id "$username" | grep -q "\bsudo\b"; then
+        gpasswd -d "$username" sudo || true
+    fi
+
+    # Запрет установки программ через ACL
+    if command -v setfacl &> /dev/null; then
+        for cmd in /usr/bin/apt /usr/bin/apt-get; do
+            if [[ -x "$cmd" ]]; then
+                setfacl -m u:"${username}:---" "$cmd" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    # Настройка SSH для туннелирования
+    SSHD_CONFIG="/etc/ssh/sshd_config"
+
+    if ! grep -q "^Match User ${username}" "$SSHD_CONFIG"; then
+        cat >> "$SSHD_CONFIG" <<EOF
 
 Match User ${username}
     AllowTcpForwarding yes
     X11Forwarding no
     PermitTunnel yes
-    # ForceCommand не даёт запустить интерактивную оболочку.
-    # sleep infinity держит соединение открытым для туннелей, но не пускает shell.
     ForceCommand echo 'Tunneling only'; sleep infinity
-    # ChrootDirectory можно включить, только если вы подготовили окружение внутри него.
-    # Пока закомментировано, чтобы не сломать вход.
-    # ChrootDirectory /home/${username}
 EOF
-   echo "Добавлен блок Match User для ${username} в sshd_config."
-   echo "После завершения нужно перезапустить sshd: sudo systemctl restart ssh"
-else
-   echo "Пользователь уже имеет блок Match в sshd_config — проверьте вручную."
-fi
+        success "Добавлен блок Match User для ${username} в sshd_config."
+    else
+        warning "Пользователь уже имеет блок Match в sshd_config — проверьте вручную."
+    fi
 
-echo ""
-echo "=== Готово ==="
-echo "Пользователь: $username"
-echo "Пароль: $password"
-echo ""
-echo "Обязательно выполните:"
-echo "  sudo systemctl restart ssh"
-echo ""
-echo "Как проверить туннель:"
-echo "  ssh -N -L 8080:localhost:80 ${username}@ваш_сервер"
-echo "Попытка обычного входа (ssh ${username}@ваш_сервер) должна выводить 'Tunneling only' и закрывать сессию."
+    echo ""
+    success "=== Готово ==="
+    echo "Пользователь: $username"
+    echo "Пароль: $password"
+    echo ""
+    echo "Обязательно выполните:"
+    echo "  sudo systemctl restart ssh"
+    echo ""
+    echo "Как проверить туннель:"
+    echo "  ssh -N -L 8080:localhost:80 ${username}@ваш_сервер"
+    echo "Попытка обычного входа (ssh ${username}@ваш_сервер) должна выводить 'Tunneling only' и закрывать сессию."
+}
+
+# Удаление пользователя
+delete_user() {
+    read -p "Введите имя пользователя для удаления: " username
+
+    if [[ -z "$username" ]]; then
+        error "Имя пользователя не может быть пустым."
+        return 1
+    fi
+
+    # Проверяем существование пользователя
+    if ! id "$username" &>/dev/null; then
+        error "Пользователь '$username' не существует."
+        return 1
+    fi
+
+    echo -n "Вы уверены, что хотите удалить пользователя '$username' и все его данные? (y/N): "
+    read -r confirm
+
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Удаление отменено."
+        return 0
+    fi
+
+    # Удаляем файл sudoers
+    sudoers_file="/etc/sudoers.d/${username}_no_sudo"
+    if [[ -f "$sudoers_file" ]]; then
+        rm -f "$sudoers_file"
+        success "Удален файл sudoers для пользователя '$username'."
+    fi
+
+    # Удаляем ACL правила
+    if command -v getfacl &> /dev/null; then
+        for cmd in /usr/bin/apt /usr/bin/apt-get; do
+            if [[ -x "$cmd" ]] && getfacl "$cmd" 2>/dev/null | grep -q "user:$username"; then
+                setfacl -x u:"$username" "$cmd" 2>/dev/null || true
+            fi
+        done
+        success "Удалены ACL правила для пользователя '$username'."
+    fi
+
+    # Удаляем блок из sshd_config
+    SSHD_CONFIG="/etc/ssh/sshd_config"
+    if grep -q "^Match User ${username}" "$SSHD_CONFIG"; then
+        # Создаем временный файл без блока пользователя
+        tmp_file=$(mktemp)
+        awk -v user="$username" '
+            /^Match User / {
+                if ($3 == user) {
+                    in_block = 1
+                    next
+                } else if (in_block) {
+                    if (/^[^ ]/) in_block = 0
+                    else next
+                }
+            }
+            !in_block
+        ' "$SSHD_CONFIG" > "$tmp_file"
+
+        # Копируем обратно, если файл изменился
+        if [[ $(wc -l < "$tmp_file") -lt $(wc -l < "$SSHD_CONFIG") ]]; then
+            cp "$tmp_file" "$SSHD_CONFIG"
+            success "Удален блок Match User для '$username' из sshd_config."
+        fi
+        rm -f "$tmp_file"
+    fi
+
+    # Удаляем пользователя и его домашнюю директорию
+    userdel -r "$username" 2>/dev/null || userdel "$username"
+
+    success
